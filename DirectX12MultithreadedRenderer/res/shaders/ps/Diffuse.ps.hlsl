@@ -1,3 +1,6 @@
+#define MAX_DIRECTIONAL_LIGHTS 4
+#define MAX_POINT_LIGHTS 8
+
 struct VertexOut
 {
 	float4 Position  : SV_POSITION;
@@ -42,54 +45,44 @@ StructuredBuffer<DirectionalLight> DirectionalLights : register(t0);
 StructuredBuffer<PointLight> PointLights : register(t1);
 
 float3 BlinnPhongLighting(in float3 normal, in float3 toEye, in float3 lightDir, in float3 r0, in float roughness, in float3 lightRadiance, in float3 albedoColor);
-float3 SchlickApprox(float3 normal, float3 f0, float3 lightDir);
-float CalculateLightAttenuation(in float3 lightPosition, in float3 position, float intensity, float range);
+float CalculateLightAttenuation(in float3 lightPosition, in float3 position, in float intensity, in float range);
+float3 SchlickApprox(in float3 normal, in float3 f0, in float3 lightDir);
 
 float4 main(VertexOut IN) : SV_Target
 {
-    float3 toEye = IN.ToEye;
-    float3 normal = IN.Normal;
+    float3 toEye = normalize(IN.ToEye);
+    float3 normal = normalize(IN.Normal);
     
-    float3 ambientLight = float3(0.3, 0.3, 0.3);	
-    float3 color = float3(0.0, 0.0, 0.0);
+    float3 color = float3(0, 0, 0); // = AlbedoDiffuse.rgb * float3(0.1, 0.1, 0.1); //Setting ambient color.
     
+    [unroll(MAX_DIRECTIONAL_LIGHTS)]
     for (int i = 0; i < DirectionalLightCount; i++)
     {
         float3 lightRadiance = DirectionalLights[i].Color * DirectionalLights[i].Intensity;
-        color += BlinnPhongLighting(normal, toEye, -DirectionalLights[i].Direction, FresnelR0, RoughnessFactor, lightRadiance, AlbedoDiffuse.rgb);
+        color += BlinnPhongLighting(normal, toEye, normalize(-DirectionalLights[i].Direction), FresnelR0, RoughnessFactor, lightRadiance, AlbedoDiffuse.rgb);
     }
     
-    for (int i = 0; i < PointLightCount; i++)
+    [unroll(MAX_POINT_LIGHTS)]
+    for (int j = 0; j < PointLightCount; j++)
     {
-        float3 lightRadiance = PointLights[i].Color * CalculateLightAttenuation(PointLights[i].Position, IN.WorldPosition.xyz, PointLights[i].Intensity, PointLights[i].Radius);
-        float3 lightDir = normalize(PointLights[i].Position - IN.WorldPosition.xyz);
+        float3 lightRadiance = PointLights[j].Color * CalculateLightAttenuation(PointLights[j].Position, IN.WorldPosition.xyz, PointLights[j].Intensity, PointLights[j].Radius);
+        float3 lightDir = normalize(PointLights[j].Position - IN.WorldPosition.xyz);
         color += BlinnPhongLighting(normal, toEye, lightDir, FresnelR0, RoughnessFactor, lightRadiance, AlbedoDiffuse.rgb);
     }
     
-    float3 ambient = AlbedoDiffuse.rgb * ambientLight;
-    
-    color = clamp(color, float3(0, 0, 0), float3(1, 1, 1));
-    return float4(color, 1.0);
+    float3 srgb = pow(color, float3(1.0f / 2.2f, 1.0f / 2.2f, 1.0f / 2.2f));
+    return float4(srgb, 1.0f);
 }
 
 float3 BlinnPhongLighting(in float3 normal, in float3 toEye, in float3 lightDir, in float3 r0, in float roughness, in float3 lightRadiance, in float3 albedoColor)    
 {
-    float3 specularColor = float3(0.5, 0.5, 0.5);
-    float3 halfwayVector = normalize(toEye + lightDir);
+    float3 diffuse = albedoColor * max(dot(lightDir, normal), 0.0);
+    float3 specular = float3(0.5f, 0.5f, 0.5f) * pow(max(dot(normalize(lightDir + toEye), normal), 0.0), 1024);
     
-    float roughnessFactor = pow(max(dot(normal, halfwayVector), 0.0), roughness);
-    float3 fresnelFactor = SchlickApprox(normal, r0, lightDir);
-
-    float ndotl = max(dot(lightDir, normal), 0.0);
-    return (albedoColor + roughnessFactor * fresnelFactor * specularColor) * lightRadiance * ndotl;
+    return lightRadiance * (diffuse + specular);
 }
 
-float3 SchlickApprox(float3 normal, float3 f0, float3 lightDir)
-{
-    return float3(f0 + (1.0 - f0) * (1 - cos(dot(lightDir, normal))));
-}
-
-float CalculateLightAttenuation(in float3 lightPosition, in float3 position, float intensity, float range)
+float CalculateLightAttenuation(in float3 lightPosition, in float3 position, in float intensity, in float range)
 {
     float distance = length(lightPosition - position);
 
@@ -99,4 +92,9 @@ float CalculateLightAttenuation(in float3 lightPosition, in float3 position, flo
     float rr = distance * distance;
 
     return intensity * (DD / (DD + Q * rr));
+}
+
+float3 SchlickApprox(in float3 normal, in float3 f0, in float3 lightDir)
+{
+    return float3(f0 + (1.0 - f0) * (1 - cos(dot(lightDir, normal))));
 }

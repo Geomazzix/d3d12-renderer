@@ -45,8 +45,8 @@ const static int s_WindowWidthInPx = 800;
 const static int s_WindowHeightInPx = 600;
 const static int s_SwapChainBufferCount = 2;
 
-const static int s_SceneCountX = 5;
-const static int s_SceneCountZ = 5;
+const static int s_SceneCountX = 45;
+const static int s_SceneCountZ = 45;
 
 const static float s_scrollSpeed = 0.02f;
 static float s_RelScrollSpeed = 0.0f;
@@ -96,6 +96,7 @@ Camera camera;
 ResourceHandler resourceHandler;
 
 std::shared_ptr<mtd3d::RenderDevice> renderDevice = std::make_shared<mtd3d::RenderDevice>();
+std::weak_ptr<mtd3d::CommandQueue> gfxQueue;
 
 //Frame resources.
 std::vector<std::unique_ptr<FrameResource<ShaderConstants>>> frameResources;
@@ -104,17 +105,25 @@ int currentFrameResourceIndex = 0;
 
 mtd3d::RootSignature rootSignature;
 
+
+//--- Function Definitions ---
+
 void HandleInput(std::shared_ptr<Input> input);
 void CreateMaterials();
 void CreateLightItems();
 void CreateRenderItems();
 void UpdateObjectCBs();
 void UpdateMaterialCBs();
+void UpdateDirectionalLightSRVs();
+void UpdatePointLightSRVs();
 void CreateFrameResources();
 void CreateRootSignature();
 void CreatePSOs(std::shared_ptr<RenderDevice> renderDevice, RenderContext& renderContext, RootSignature& rootSignature);
-void Update(std::weak_ptr<CommandQueue> commandQueue);
-void Draw(RenderContext& renderContext, std::weak_ptr<CommandQueue> commandQueue);
+void Tick();
+void Draw(RenderContext& renderContext);
+
+
+//--- Main functionality/loops ---
 
 int WINAPI main(HINSTANCE appModule, HINSTANCE prevModule, PSTR cmdline, int showCmd)
 {
@@ -129,7 +138,6 @@ int WINAPI main(HINSTANCE appModule, HINSTANCE prevModule, PSTR cmdline, int sho
 	EventMessenger::GetInstance().AddMessenger<MouseWheelEventArgs&>("OnMouseScrollWheelChanged");
 
 	Time s_Time;
-	jobSystem.Initialize();
 
 	window.Initialize(appModule, input, L"Direct3D 12 multithreaded rendering", s_WindowWidthInPx, s_WindowHeightInPx);
 	EventMessenger::GetInstance().ConnectListener<MouseWheelEventArgs&>("OnMouseScrollWheelChanged", &OnScrollWheelChanged);
@@ -150,18 +158,22 @@ int WINAPI main(HINSTANCE appModule, HINSTANCE prevModule, PSTR cmdline, int sho
 
 	s_Time.Reset();
 
+	gfxQueue = renderDevice->GetCommandQueue(D3D12_COMMAND_LIST_TYPE::D3D12_COMMAND_LIST_TYPE_DIRECT);
 	while(!window.DoesWinAPIWindowClose())
 	{	
 		s_Time.Tick();
 
-		auto commandQueue = renderDevice->GetCommandQueue(D3D12_COMMAND_LIST_TYPE::D3D12_COMMAND_LIST_TYPE_DIRECT);
+		currentFrameResourceIndex = (currentFrameResourceIndex + 1) % static_cast<int>(frameResources.size());
+		currentFrameResource = frameResources[currentFrameResourceIndex].get();
 
-		Update(commandQueue);
-		Draw(renderContext, commandQueue);
+		gfxQueue.lock()->WaitOnFenceValue(currentFrameResource->FenceValue); //Wait for the current frame resource.
+
+		Tick();
+		Draw(renderContext);
 
 		renderContext.Present();
-		commandQueue.lock()->Signal();
-		currentFrameResource->FenceValue = commandQueue.lock()->GetFenceValue();
+		gfxQueue.lock()->Signal();
+		currentFrameResource->FenceValue = gfxQueue.lock()->GetFenceValue();
 
 		window.PollEvents();
 		window.UpdateWindowText();
@@ -175,67 +187,109 @@ int WINAPI main(HINSTANCE appModule, HINSTANCE prevModule, PSTR cmdline, int sho
 	return 0;
 }
 
-void HandleInput(std::shared_ptr<Input> input)
+void Tick()
 {
-	if (input->IsPressed(KeyCode::LButton) != 0)
-	{
-		// Make each pixel correspond to a quarter of a degree.
-		float dx = XMConvertToRadians(0.25f * static_cast<float>(input->GetMouseX() - lastMousePos.x));
-		float dy = XMConvertToRadians(0.25f * static_cast<float>(input->GetMouseY() - lastMousePos.y));
+	HandleInput(input);
 
-		// Update angles based on input to orbit camera around box.
-		theta -= dx;
-		phi -= dy;
+	UpdateMaterialCBs();
+	UpdateObjectCBs();
 
-		// Restrict the angle mPhi.
-		phi = Clamp(phi, 0.1f, XM_PI - 0.1f);
-
-		//Make sure to update the dirty frames whenever the camera changed.
-		for(auto& ri : renderItems)
-		{
-			ri.NumFramesDirty = static_cast<int>(frameResources.size());
-		}
-	}
-	else if (abs(s_RelScrollSpeed) > 0.0f)
-	{
-		// Update the camera radius based on input.
-		radius -= s_RelScrollSpeed;
-
-		// Restrict the radius.
-		radius = Clamp(radius, 5.0f, 200.0f);
-		s_RelScrollSpeed = 0.0f;
-
-		//Make sure to update the dirty frames whenever the camera changed.
-		for (auto& ri : renderItems)
-		{
-			ri.NumFramesDirty = static_cast<int>(frameResources.size());
-		}
-	}
-
-	if(input->IsPressed(KeyCode::F1))
-	{
-		renderMode = ERenderMode::DIFFUSE;
-	}
-	else if(input->IsPressed(KeyCode::F2))
-	{
-		renderMode = ERenderMode::WIREFRAME;
-	}
-
-	lastMousePos.x = static_cast<LONG>(input->GetMouseX());
-	lastMousePos.y = static_cast<LONG>(input->GetMouseY());
-
-	// Convert Spherical to Cartesian coordinates.
-	float x = radius * sinf(phi) * cosf(theta);
-	float z = radius * sinf(phi) * sinf(theta);
-	float y = radius * cosf(phi);
-
-	XMVECTOR pos = XMVectorSet(x, y, z, 1.0f);
-	XMVECTOR target = XMVectorZero();
-	XMVECTOR up = XMVectorSet(0.0f, 1.0f, 0.0f, 0.0f);
-
-	XMStoreFloat3(&cameraPosition, pos);
-	view = XMMatrixLookAtLH(pos, target, up);
+	UpdateDirectionalLightSRVs();
+	UpdatePointLightSRVs();
 }
+
+void Draw(RenderContext& renderContext)
+{
+	auto cmdListAllocator = currentFrameResource->CommandAllocator;
+
+	D3D_CHECK(cmdListAllocator->Reset());
+
+	auto commandList = gfxQueue.lock()->GetCommandList(cmdListAllocator);
+	commandList.lock()->TransitionResource(
+		renderContext.GetCurrentBackBuffer().Get(),
+		D3D12_RESOURCE_STATES::D3D12_RESOURCE_STATE_PRESENT,
+		D3D12_RESOURCE_STATES::D3D12_RESOURCE_STATE_RENDER_TARGET
+	);
+
+	//PRE RENDER. ---------------------------------------------------------------------------------------------------------------
+	switch (renderMode)
+	{
+	case ERenderMode::DIFFUSE:
+		commandList.lock()->SetPipelineStateObject(diffusePSO->Get());
+		break;
+	case ERenderMode::WIREFRAME:
+		commandList.lock()->SetPipelineStateObject(wireFramePSO->Get());
+		break;
+	}
+	renderContext.SetRSProperties(commandList.lock());
+
+	const float clearScreenColor[4] = { 0.3f, 0.5f, 0.2f, 1.0f };
+
+	commandList.lock()->GetCmdList()->ClearRenderTargetView(renderContext.GetCurrentBackBufferView(), clearScreenColor, 0, nullptr);
+	commandList.lock()->GetCmdList()->ClearDepthStencilView(
+		renderContext.GetDepthStencilView(),
+		D3D12_CLEAR_FLAGS::D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAGS::D3D12_CLEAR_FLAG_STENCIL,
+		1.0f, 0, 0, nullptr
+	);
+
+	D3D12_CPU_DESCRIPTOR_HANDLE rtvHandle = renderContext.GetCurrentBackBufferView();
+	D3D12_CPU_DESCRIPTOR_HANDLE dsvHandle = renderContext.GetDepthStencilView();
+	commandList.lock()->GetCmdList()->OMSetRenderTargets(1, &rtvHandle, TRUE, &dsvHandle);
+
+	//DRAWING ITEMS. ------------------------------------------------------------------------------------------------------------
+	commandList.lock()->GetCmdList()->SetGraphicsRootSignature(rootSignature.Get().Get());
+
+	//Lights.
+	LightConstants lightConstants;
+	lightConstants.DirectionalLightCount = directionalLightItems.size();
+	lightConstants.PointLightCount = pointLightItems.size();
+	commandList.lock()->GetCmdList()->SetGraphicsRoot32BitConstants(2, sizeof(LightConstants) / sizeof(uint32_t), &lightConstants, 0);
+
+	if (directionalLightItems.size() > 0)
+	{
+		UINT dirLightSVSizeInBytes = sizeof(DirectionalLight);
+		auto dirLightSv = currentFrameResource->DirectionalLightSR->GetResource();
+		commandList.lock()->GetCmdList()->SetGraphicsRootShaderResourceView(3, dirLightSv->GetGPUVirtualAddress());
+	}
+
+	if (pointLightItems.size() > 0)
+	{
+		UINT pointLightSVSizeInBytes = sizeof(PointLight);
+		auto pointLightSv = currentFrameResource->PointLightSR->GetResource();
+		commandList.lock()->GetCmdList()->SetGraphicsRootShaderResourceView(4, pointLightSv->GetGPUVirtualAddress());
+	}
+
+	//Meshes
+	UINT objCBSizeInBytes = CalcConstantBufferByteSize(sizeof(ShaderConstants));
+	UINT matCBSizeInBytes = CalcConstantBufferByteSize(sizeof(MaterialConstants));
+
+	auto objectCb = currentFrameResource->ObjectCB->GetResource();
+	auto materialCb = currentFrameResource->MaterialCB->GetResource();
+
+	for (int i = 0; i < renderItems.size(); i++)
+	{
+		D3D12_GPU_VIRTUAL_ADDRESS cbObject = objectCb->GetGPUVirtualAddress() + renderItems[i].ObjectCBIndex * objCBSizeInBytes;
+		D3D12_GPU_VIRTUAL_ADDRESS cbMat = materialCb->GetGPUVirtualAddress() + renderItems[i].MaterialInstance.lock()->CbIndex * matCBSizeInBytes;
+
+		commandList.lock()->GetCmdList()->SetGraphicsRootConstantBufferView(0, cbObject);
+		commandList.lock()->GetCmdList()->SetGraphicsRootConstantBufferView(1, cbMat);
+
+		commandList.lock()->SetPrimitiveTopology(renderItems[i].PrimitiveType);
+		renderItems[i].MeshInstance.lock()->RecordDrawCommand(commandList, 1, 0);
+	}
+
+	//END RENDER ----------------------------------------------------------------------------------------------------------------
+	commandList.lock()->TransitionResource(
+		renderContext.GetCurrentBackBuffer().Get(),
+		D3D12_RESOURCE_STATES::D3D12_RESOURCE_STATE_RENDER_TARGET,
+		D3D12_RESOURCE_STATES::D3D12_RESOURCE_STATE_PRESENT
+	);
+
+	gfxQueue.lock()->ExecuteCommandList(commandList);
+}
+
+
+//--- Creation/Initialization ---
 
 void CreateMaterials()
 {
@@ -257,21 +311,39 @@ void CreateLightItems()
 	sunLight.Color = XMFLOAT3(1.0f, 1.0f, 1.0f);
 	directionalLightItems.push_back(sunLight);
 
-	sunLight.Direction = XMFLOAT3(-1.0f, 0.0f, 1.0);
-	sunLight.Intensity = 1.0f;
-	sunLight.Color = XMFLOAT3(0.5, 0.5, 0.5);
-	directionalLightItems.push_back(sunLight);
+	PointLight pointLight;
+	pointLight.Position = XMFLOAT3(-20.0f, 20.0f, -20.0f);
+	pointLight.Intensity = 1.5f;
+	pointLight.Color = XMFLOAT3(1.0f, 1.0f, 1.0f);
+	pointLight.Radius = 35.0f;
+	pointLightItems.push_back(pointLight);
 
-	sunLight.Direction = XMFLOAT3(1.0f, 0.0f, 1.0);
-	sunLight.Intensity = 1.0f;
-	sunLight.Color = XMFLOAT3(0.5f, 0.5f, 0.5f);
-	directionalLightItems.push_back(sunLight);
+	PointLight pointLight1;
+	pointLight1.Position = XMFLOAT3(20.0f, 20.0f, 20.0f);
+	pointLight1.Intensity = 1.5f;
+	pointLight1.Color = XMFLOAT3(1.0f, 1.0f, 0.0f);
+	pointLight1.Radius = 35.0f;
+	pointLightItems.push_back(pointLight1);
+
+	PointLight pointLight2;
+	pointLight2.Position = XMFLOAT3(-20.0f, 20.0f, 20.0f);
+	pointLight2.Intensity = 1.5f;
+	pointLight2.Color = XMFLOAT3(1.0f, 0.0f, 1.0f);
+	pointLight2.Radius = 35.0f;
+	pointLightItems.push_back(pointLight2);
+
+	PointLight pointLight3;
+	pointLight3.Position = XMFLOAT3(20.0f, 20.0f, -20.0f);
+	pointLight3.Intensity = 1.5f;
+	pointLight3.Color = XMFLOAT3(0.0f, 1.0f, 1.0f);
+	pointLight3.Radius = 35.0f;
+	pointLightItems.push_back(pointLight3);
 }
 
 void CreateRenderItems()
 {
-	const float sceneWidth = 10.0f;
-	const float sceneLength = 10.0f;
+	const float sceneWidth = 20.0f;
+	const float sceneLength = 20.0f;
 
 	resourceHandler.CacheMesh("Ground", MeshUtility::CreatePlane(renderDevice, sceneWidth, sceneLength, 100, 100, XMFLOAT4(Colors::Green)));
 	std::weak_ptr<Mesh> groundMesh = resourceHandler.GetMesh("Ground");
@@ -300,8 +372,6 @@ void CreateRenderItems()
 			RenderItem ri(s_FrameResourceCount, ++cbIndex, groundMesh, resourceHandler.GetMaterial("diffuseMaterial"));
 			XMStoreFloat4x4(&ri.ModelMatrix, XMMatrixTranslationFromVector(XMVectorSet(offsetX, 0.0f, offsetZ, 1)));
 			renderItems.push_back(ri);
-
-			return;
 
 			//Center sphere.
 			ri.ObjectCBIndex = ++cbIndex;
@@ -384,70 +454,6 @@ void CreateRootSignature()
 	rootSignature.Initialize(renderDevice, rootSignDesc);
 }
 
-void UpdateObjectCBs()
-{
-	auto currentObjectCB = currentFrameResource->ObjectCB.get();
-	for(auto& ri : renderItems)
-	{
-		if (ri.NumFramesDirty <= 0)
-			continue;
-
-		//Calculate the worldViewProj.
-		XMMATRIX world = XMLoadFloat4x4(&ri.ModelMatrix);
-		XMFLOAT4X4 camProj = camera.GetProjection();
-		XMMATRIX proj = XMLoadFloat4x4(&camProj);
-		XMFLOAT4 cameraPos(cameraPosition.x, cameraPosition.y, cameraPosition.z, 1.0f);
-
-		XMMATRIX inverseWorld = XMMatrixInverse(nullptr, world);
-		XMMATRIX normalMatrix = XMMatrixTranspose(inverseWorld);
-
-		// Update the constant buffer with the latest worldViewProj matrix.
-		ShaderConstants objConstants;
-		XMStoreFloat4x4(&objConstants.ViewProjectionMatrix, XMMatrixTranspose(view * proj));
-		XMStoreFloat4x4(&objConstants.ModelMatrix, XMMatrixTranspose(world));
-		XMStoreFloat4x4(&objConstants.NormalMatrix, normalMatrix);
-		XMStoreFloat4(&objConstants.CameraPosition, XMLoadFloat4(&cameraPos));
-		currentObjectCB->CopyData(ri.ObjectCBIndex, objConstants);
-
-		ri.NumFramesDirty--;
-	}
-}
-
-void UpdateMaterialCBs()
-{
-	std::shared_ptr<Material> material = resourceHandler.GetMaterial("diffuseMaterial").lock();
-
-	if (material->NumFramesDirty <= 0)
-		return;
-
-	auto currentMaterialCb = currentFrameResource->MaterialCB.get();
-	MaterialConstants materialConstants;
-	materialConstants.AlbedoDiffuse = material->Constants.AlbedoDiffuse;
-	materialConstants.FresnelR0 = material->Constants.FresnelR0;
-	materialConstants.RoughnessFactor = material->Constants.RoughnessFactor;
-
-	currentMaterialCb->CopyData(material->CbIndex, materialConstants);
-	material->NumFramesDirty--;
-}
-
-void UpdateDirectionalLightSRVs()
-{
-	auto directionalLightSrv = currentFrameResource->DirectionalLightSR.get();
-	for(int i = 0; i < directionalLightItems.size(); i++)
-	{
-		directionalLightSrv->CopyData(i, directionalLightItems[i]);
-	}
-}
-
-void UpdatePointLightSRVs()
-{
-	auto pointLightSrv = currentFrameResource->PointLightSR.get();
-	for (int i = 0; i < pointLightItems.size(); i++)
-	{
-		pointLightSrv->CopyData(i, pointLightItems[i]);
-	}
-}
-
 void CreatePSOs(std::shared_ptr<RenderDevice> renderDevice, RenderContext& renderContext, RootSignature& rootSignature)
 {
 	//Load the shaders.
@@ -524,108 +530,132 @@ void CreatePSOs(std::shared_ptr<RenderDevice> renderDevice, RenderContext& rende
 	wireFramePSO = renderDevice->CreatePipelineStateObject<WireFramePipelineStream>(WireframeStream);
 }
 
-void Update(std::weak_ptr<CommandQueue> commandQueue)
+
+//--- Tick/Update functionality ---
+
+void UpdateObjectCBs()
 {
-	currentFrameResourceIndex = (currentFrameResourceIndex + 1) % static_cast<int>(frameResources.size());
-	currentFrameResource = frameResources[currentFrameResourceIndex].get();
+	auto currentObjectCB = currentFrameResource->ObjectCB.get();
+	for(auto& ri : renderItems)
+	{
+		if (ri.NumFramesDirty <= 0)
+			continue;
 
-	commandQueue.lock()->WaitOnFenceValue(currentFrameResource->FenceValue); //Wait for the current frame resource.
-	
-	HandleInput(input);
-	
-	UpdateMaterialCBs();
-	UpdateObjectCBs();
+		//Calculate the worldViewProj.
+		XMMATRIX world = XMLoadFloat4x4(&ri.ModelMatrix);
+		XMFLOAT4X4 camProj = camera.GetProjection();
+		XMMATRIX proj = XMLoadFloat4x4(&camProj);
+		XMFLOAT4 cameraPos(cameraPosition.x, cameraPosition.y, cameraPosition.z, 1.0f);
 
-	UpdateDirectionalLightSRVs();
-	UpdatePointLightSRVs();
+
+		XMMATRIX inverseWorld = XMMatrixInverse(nullptr, world);
+		XMMATRIX normalMatrix = XMMatrixTranspose(inverseWorld);
+
+		// Update the constant buffer with the latest worldViewProj matrix.
+		ShaderConstants objConstants;
+		XMStoreFloat4x4(&objConstants.ViewProjectionMatrix, XMMatrixTranspose(view * proj));
+		XMStoreFloat4x4(&objConstants.ModelMatrix, XMMatrixTranspose(world));
+		XMStoreFloat4x4(&objConstants.NormalMatrix, normalMatrix);
+		XMStoreFloat4(&objConstants.CameraPosition, XMLoadFloat4(&cameraPos));
+		currentObjectCB->CopyData(ri.ObjectCBIndex, objConstants);
+
+		ri.NumFramesDirty--;
+	}
 }
 
-void Draw(RenderContext& renderContext, std::weak_ptr<CommandQueue> commandQueue)
+void UpdateMaterialCBs()
 {
-	auto cmdListAllocator = currentFrameResource->CommandAllocator;
+	std::shared_ptr<Material> material = resourceHandler.GetMaterial("diffuseMaterial").lock();
 
-	D3D_CHECK(cmdListAllocator->Reset());
+	if (material->NumFramesDirty <= 0)
+		return;
 
-	auto commandList = commandQueue.lock()->GetCommandList(cmdListAllocator);
-	commandList.lock()->TransitionResource(
-		renderContext.GetCurrentBackBuffer().Get(),
-		D3D12_RESOURCE_STATES::D3D12_RESOURCE_STATE_PRESENT,
-		D3D12_RESOURCE_STATES::D3D12_RESOURCE_STATE_RENDER_TARGET
-	);
+	auto currentMaterialCb = currentFrameResource->MaterialCB.get();
+	MaterialConstants materialConstants;
+	materialConstants.AlbedoDiffuse = material->Constants.AlbedoDiffuse;
+	materialConstants.FresnelR0 = material->Constants.FresnelR0;
+	materialConstants.RoughnessFactor = material->Constants.RoughnessFactor;
 
-	//PRE RENDER. ---------------------------------------------------------------------------------------------------------------
-	switch(renderMode)
+	currentMaterialCb->CopyData(material->CbIndex, materialConstants);
+	material->NumFramesDirty--;
+}
+
+void UpdateDirectionalLightSRVs()
+{
+	auto directionalLightSrv = currentFrameResource->DirectionalLightSR.get();
+	for(int i = 0; i < directionalLightItems.size(); i++)
 	{
-		case ERenderMode::DIFFUSE:
-			commandList.lock()->SetPipelineStateObject(diffusePSO->Get());
-			break;
-		case ERenderMode::WIREFRAME:
-			commandList.lock()->SetPipelineStateObject(wireFramePSO->Get());
-			break;
+		directionalLightSrv->CopyData(i, directionalLightItems[i]);
 	}
-	renderContext.SetRSProperties(commandList.lock());
+}
 
-	const float clearScreenColor[4] = { 0.3f, 0.5f, 0.2f, 1.0f };
-
-	commandList.lock()->GetCmdList()->ClearRenderTargetView(renderContext.GetCurrentBackBufferView(), clearScreenColor, 0, nullptr);
-	commandList.lock()->GetCmdList()->ClearDepthStencilView(
-		renderContext.GetDepthStencilView(),
-		D3D12_CLEAR_FLAGS::D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAGS::D3D12_CLEAR_FLAG_STENCIL,
-		1.0f, 0, 0, nullptr
-	);
-
-	D3D12_CPU_DESCRIPTOR_HANDLE rtvHandle = renderContext.GetCurrentBackBufferView();
-	D3D12_CPU_DESCRIPTOR_HANDLE dsvHandle = renderContext.GetDepthStencilView();
-	commandList.lock()->GetCmdList()->OMSetRenderTargets(1, &rtvHandle, TRUE, &dsvHandle);
-
-	//DRAWING ITEMS. ------------------------------------------------------------------------------------------------------------
-	commandList.lock()->GetCmdList()->SetGraphicsRootSignature(rootSignature.Get().Get());
-
-	//Lights.
-	LightConstants lightConstants;
-	lightConstants.DirectionalLightCount = directionalLightItems.size();
-	lightConstants.PointLightCount = pointLightItems.size();
-	commandList.lock()->GetCmdList()->SetGraphicsRoot32BitConstants(2, sizeof(LightConstants) / sizeof(uint32_t), &lightConstants, 0);
-
-	if(directionalLightItems.size() > 0)
+void UpdatePointLightSRVs()
+{
+	auto pointLightSrv = currentFrameResource->PointLightSR.get();
+	for (int i = 0; i < pointLightItems.size(); i++)
 	{
-		UINT dirLightSVSizeInBytes = sizeof(DirectionalLight);
-		auto dirLightSv = currentFrameResource->DirectionalLightSR->GetResource();
-		commandList.lock()->GetCmdList()->SetGraphicsRootShaderResourceView(3, dirLightSv->GetGPUVirtualAddress());
+		pointLightSrv->CopyData(i, pointLightItems[i]);
 	}
+}
 
-	if(pointLightItems.size() > 0)
+void HandleInput(std::shared_ptr<Input> input)
+{
+	if (input->IsPressed(KeyCode::LButton) != 0)
 	{
-		UINT pointLightSVSizeInBytes = sizeof(PointLight);
-		auto pointLightSv = currentFrameResource->PointLightSR->GetResource();
-		commandList.lock()->GetCmdList()->SetGraphicsRootShaderResourceView(4, pointLightSv->GetGPUVirtualAddress());
+		// Make each pixel correspond to a quarter of a degree.
+		float dx = XMConvertToRadians(0.25f * static_cast<float>(input->GetMouseX() - lastMousePos.x));
+		float dy = XMConvertToRadians(0.25f * static_cast<float>(input->GetMouseY() - lastMousePos.y));
+
+		// Update angles based on input to orbit camera around box.
+		theta -= dx;
+		phi -= dy;
+
+		// Restrict the angle mPhi.
+		phi = Clamp(phi, 0.1f, XM_PI - 0.1f);
+
+		//Make sure to update the dirty frames whenever the camera changed.
+		for (auto& ri : renderItems)
+		{
+			ri.NumFramesDirty = static_cast<int>(frameResources.size());
+		}
 	}
-
-	//Meshes
-	UINT objCBSizeInBytes = CalcConstantBufferByteSize(sizeof(ShaderConstants));
-	UINT matCBSizeInBytes = CalcConstantBufferByteSize(sizeof(MaterialConstants));
-
-	auto objectCb = currentFrameResource->ObjectCB->GetResource();
-	auto materialCb = currentFrameResource->MaterialCB->GetResource();
-
-	for (int i = 0; i < renderItems.size(); i++)
+	else if (abs(s_RelScrollSpeed) > 0.0f)
 	{
-		D3D12_GPU_VIRTUAL_ADDRESS cbObject = objectCb->GetGPUVirtualAddress() + renderItems[i].ObjectCBIndex * objCBSizeInBytes;
-		D3D12_GPU_VIRTUAL_ADDRESS cbMat = materialCb->GetGPUVirtualAddress() + renderItems[i].MaterialInstance.lock()->CbIndex * matCBSizeInBytes;
-		
-		commandList.lock()->GetCmdList()->SetGraphicsRootConstantBufferView(0, cbObject);
-		commandList.lock()->GetCmdList()->SetGraphicsRootConstantBufferView(1, cbMat);
+		// Update the camera radius based on input.
+		radius -= s_RelScrollSpeed;
 
-		commandList.lock()->SetPrimitiveTopology(renderItems[i].PrimitiveType);
-		renderItems[i].MeshInstance.lock()->RecordDrawCommand(commandList, 1, 0);
+		// Restrict the radius.
+		radius = Clamp(radius, 5.0f, 200.0f);
+		s_RelScrollSpeed = 0.0f;
+
+		//Make sure to update the dirty frames whenever the camera changed.
+		for (auto& ri : renderItems)
+		{
+			ri.NumFramesDirty = static_cast<int>(frameResources.size());
+		}
 	}
 
-	//END RENDER ----------------------------------------------------------------------------------------------------------------
-	commandList.lock()->TransitionResource(
-		renderContext.GetCurrentBackBuffer().Get(),
-		D3D12_RESOURCE_STATES::D3D12_RESOURCE_STATE_RENDER_TARGET,
-		D3D12_RESOURCE_STATES::D3D12_RESOURCE_STATE_PRESENT
-	);
+	if (input->IsPressed(KeyCode::F1))
+	{
+		renderMode = ERenderMode::DIFFUSE;
+	}
+	else if (input->IsPressed(KeyCode::F2))
+	{
+		renderMode = ERenderMode::WIREFRAME;
+	}
 
-	commandQueue.lock()->ExecuteCommandList(commandList);
+	lastMousePos.x = static_cast<LONG>(input->GetMouseX());
+	lastMousePos.y = static_cast<LONG>(input->GetMouseY());
+
+	// Convert Spherical to Cartesian coordinates.
+	float x = radius * sinf(phi) * cosf(theta);
+	float z = radius * sinf(phi) * sinf(theta);
+	float y = radius * cosf(phi);
+
+	XMVECTOR pos = XMVectorSet(x, y, z, 1.0f);
+	XMVECTOR target = XMVectorZero();
+	XMVECTOR up = XMVectorSet(0.0f, 1.0f, 0.0f, 0.0f);
+
+	XMStoreFloat3(&cameraPosition, pos);
+	view = XMMatrixLookAtLH(pos, target, up);
 }

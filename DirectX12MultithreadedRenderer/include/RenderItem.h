@@ -21,7 +21,7 @@ namespace mtd3d
 		D3D12_PRIMITIVE_TOPOLOGY PrimitiveType = D3D12_PRIMITIVE_TOPOLOGY::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
 		
 		XMFLOAT4X4 ModelMatrix = Identity();
-		std::weak_ptr<Mesh> MeshInstance = std::weak_ptr<Mesh>(); //Serves as nullptr.
+		std::weak_ptr<Mesh> MeshInstance;
 		std::weak_ptr<Material> MaterialInstance;
 
 		RenderItem(int numFrames, UINT objectCBIndex, std::weak_ptr<Mesh> mesh, std::weak_ptr<Material> material, D3D12_PRIMITIVE_TOPOLOGY primitiveType = D3D12_PRIMITIVE_TOPOLOGY::D3D10_PRIMITIVE_TOPOLOGY_TRIANGLELIST)

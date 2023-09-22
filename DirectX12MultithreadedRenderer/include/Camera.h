@@ -33,6 +33,8 @@ namespace mtd3d
 		void OnClientResize(ResizeEventArgs& e);
 
 	private:
+		void RecalculateProjectionMatrix();
+
 		DirectX::XMFLOAT4X4 m_Projection;
 		unsigned int m_ClientWidth;
 		unsigned int m_ClientHeight;
@@ -40,7 +42,5 @@ namespace mtd3d
 		float m_ZNear;
 		float m_ZFar;
 		bool m_IsDirty;
-
-		void RecalculateProjectionMatrix();
 	};
 }
